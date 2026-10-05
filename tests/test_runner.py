@@ -247,7 +247,7 @@ class RunnerTests(unittest.TestCase):
     def test_inspection_requires_other_provider_and_fresh_session(self):
         code, _, _, error = self.invoke(mode="inspect", extra=("--base", self.base, "--provider", "claude"))
         self.assertEqual(code, 1)
-        self.assertIn("opposite the builder", error)
+        self.assertIn("opposite the inspection counterpart", error)
         _, _, previous, _ = self.invoke()
         code, _, _, error = self.invoke(mode="inspect", extra=("--base", self.base, "--resume", str(previous)))
         self.assertEqual(code, 1)

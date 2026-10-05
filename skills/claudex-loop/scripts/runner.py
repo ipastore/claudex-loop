@@ -147,9 +147,22 @@ def command(provider: str, mode: str, run_dir: Path, model=None, effort=None,
     review = mode != "build"
     if provider == "codex":
         args = ["exec"] + (["resume", session] if session else [])
+        # Builds run WITHOUT the sandbox so the builder can reach the Docker
+        # socket and therefore run `supabase db reset` and the SQL harness.
+        # Measured 2026-09-15, same machine and second:
+        #   codex exec -s workspace-write  -> permission denied ... /var/run/docker.sock
+        #   codex exec --dangerously-...   -> supabase_db_supabase-harness
+        # workspace-write confines the process to the project directory, and the
+        # socket is outside it, so a sandboxed build can never test its own SQL.
+        # Owner decision (scouting.cronolix): the builder executes a plan the HOST
+        # wrote and the builder itself attacked -- not one it authored -- so the
+        # residual risk is a spec-following process with machine access, not an
+        # unsupervised agent acting on its own design.
+        # REVIEWS ARE UNCHANGED and stay read-only.
         args += (["-c", 'sandbox_mode="read-only"'] if session and review else
-                 ["-c", 'sandbox_mode="workspace-write"'] if session else
-                 ["-s", "read-only" if review else "workspace-write"])
+                 ["--dangerously-bypass-approvals-and-sandbox"] if session else
+                 ["-s", "read-only"] if review else
+                 ["--dangerously-bypass-approvals-and-sandbox"])
         args += ["-c", 'approval_policy="never"', "--json", "-o", str(run_dir / "reply.txt")]
         if review:
             args += ["--skip-git-repo-check", "--output-schema", str(run_dir / "schema.json")]
@@ -276,10 +289,42 @@ def run(args) -> int:
     roles = resolve_roles(args.host, builder=args.builder)
     provider = args.provider or (roles["builder"] if args.mode == "build" else
                                  roles["inspector"] if args.mode == "inspect" else roles["reviewer"])
+    # The hazard this guards is a model reviewing code or a plan it wrote itself, and
+    # "opposite provider" was a proxy for "different model". That proxy is too coarse when the
+    # point is to ESCALATE within a provider (e.g. Opus 5 builds, Fable 5.1 reads the diff).
+    # So same-provider pairing is permitted only when both models are named explicitly and
+    # they differ; an unnamed model still falls back to the original, stricter rule, because
+    # an unknown model cannot be proven different from the one that did the work.
+    def _same_provider_allowed(counterpart_model: str | None, role: str) -> None:
+        if not args.model or not counterpart_model:
+            raise RunError(
+                f"{role} must use the provider opposite the {role.lower()} counterpart, "
+                "or name both models explicitly (--model and --counterpart-model) so they can "
+                "be proven different."
+            )
+        if args.model == counterpart_model:
+            # Opt-in, never a default (owner decision, 2026-09-10). The legitimate case is
+            # "this model is simply the best one I have and I have the quota", and refusing it
+            # outright forces a worse model into one of the two roles. The cost is real and is
+            # printed rather than buried: a fresh session removes shared *context*, not shared
+            # *priors*, so the reviewer misses by construction whatever the builder missed.
+            if not args.allow_same_model:
+                raise RunError(
+                    f"{role} cannot use the same model that produced the work "
+                    f"({args.model}); self-review is not a second opinion at any temperature. "
+                    "Pass --allow-same-model to do it deliberately."
+                )
+            print(
+                f"claudex-loop: WARNING — {role.lower()} runs on {args.model}, the same model "
+                "that produced the work. A fresh session removes shared context, not shared "
+                "blind spots. Recorded in result.json as same_model_review.",
+                file=sys.stderr,
+                flush=True,
+            )
     if args.mode == "review" and provider == args.host:
-        raise RunError("Plan review must use the provider opposite the planner/host.")
+        _same_provider_allowed(args.counterpart_model, "Plan review")
     if args.mode == "inspect" and provider == roles["builder"]:
-        raise RunError("Inspection must use the provider opposite the builder.")
+        _same_provider_allowed(args.counterpart_model, "Inspection")
     if args.mode == "check":
         if not args.approval:
             raise RunError("check requires --approval result.json.")
@@ -313,6 +358,7 @@ def run(args) -> int:
     record = {"status": "running", "mode": args.mode, "provider": provider, "roles": roles,
               "repo": str(repo), "plan": str(plan), "plan_sha256": digest(plan_body),
               "requested_model": args.model, "requested_effort": args.effort,
+              "same_model_review": bool(getattr(args, "allow_same_model", False)),
               "base": args.base, "snapshot": before, "previous": args.resume,
               "started_at": time.time(), "artifacts": str(run_dir)}
     save(run_dir / "result.json", record)
@@ -393,6 +439,8 @@ def main(argv=None) -> int:
     parser.add_argument("--repo", default=".")
     parser.add_argument("--plan", default="PLAN.md")
     parser.add_argument("--model", help="Explicit model override; omitted means provider CLI default.")
+    parser.add_argument("--counterpart-model", help="Model that produced the work being reviewed; required to pair two models from the same provider.")
+    parser.add_argument("--allow-same-model", action="store_true", help="Deliberately let the reviewer run on the SAME model that produced the work. Off by default; recorded in result.json.")
     parser.add_argument("--cli", help="Absolute CLI executable path when PATH resolves to an older installation.")
     parser.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"))
     parser.add_argument("--resume", help="Prior successful result.json, never a guessed session or --last.")
