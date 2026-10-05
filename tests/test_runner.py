@@ -244,6 +244,18 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(next(f for f in snap["files"] if f["path"] == "existing.py")["sha256"],
                          runner.digest((self.repo / "existing.py").read_bytes()))
 
+    def test_unsandboxed_build_is_opt_in_and_never_reaches_review(self):
+        build = lambda: runner.command("codex", "build", Path("/tmp/run"))
+        review = lambda: runner.command("codex", "review", Path("/tmp/run"))
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDEX_UNSANDBOXED_BUILD", None)
+            self.assertIn("workspace-write", build())
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", build())
+        with patch.dict(os.environ, {"CLAUDEX_UNSANDBOXED_BUILD": "1"}):
+            self.assertIn("--dangerously-bypass-approvals-and-sandbox", build())
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", review())
+            self.assertIn("read-only", review())
+
     def test_inspection_requires_other_provider_and_fresh_session(self):
         code, _, _, error = self.invoke(mode="inspect", extra=("--base", self.base, "--provider", "claude"))
         self.assertEqual(code, 1)

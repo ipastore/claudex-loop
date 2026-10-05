@@ -147,22 +147,20 @@ def command(provider: str, mode: str, run_dir: Path, model=None, effort=None,
     review = mode != "build"
     if provider == "codex":
         args = ["exec"] + (["resume", session] if session else [])
-        # Builds run WITHOUT the sandbox so the builder can reach the Docker
-        # socket and therefore run `supabase db reset` and the SQL harness.
-        # Measured 2026-09-15, same machine and second:
+        # Builds run WITHOUT the sandbox only when the repo opts in with
+        # CLAUDEX_UNSANDBOXED_BUILD=1 (e.g. `env` in its .claude/settings.json).
+        # Why a repo would: workspace-write confines Codex to the project directory,
+        # and the Docker socket is outside it, so a sandboxed build can never run
+        # `supabase db reset` or a SQL harness. Measured 2026-09-15:
         #   codex exec -s workspace-write  -> permission denied ... /var/run/docker.sock
         #   codex exec --dangerously-...   -> supabase_db_supabase-harness
-        # workspace-write confines the process to the project directory, and the
-        # socket is outside it, so a sandboxed build can never test its own SQL.
-        # Owner decision (scouting.cronolix): the builder executes a plan the HOST
-        # wrote and the builder itself attacked -- not one it authored -- so the
-        # residual risk is a spec-following process with machine access, not an
-        # unsupervised agent acting on its own design.
-        # REVIEWS ARE UNCHANGED and stay read-only.
+        # Off by default, because it gives the builder the host's access unattended.
+        # REVIEWS ALWAYS STAY READ-ONLY.
+        unsandboxed = not review and os.environ.get("CLAUDEX_UNSANDBOXED_BUILD") == "1"
         args += (["-c", 'sandbox_mode="read-only"'] if session and review else
-                 ["--dangerously-bypass-approvals-and-sandbox"] if session else
-                 ["-s", "read-only"] if review else
-                 ["--dangerously-bypass-approvals-and-sandbox"])
+                 ["--dangerously-bypass-approvals-and-sandbox"] if unsandboxed else
+                 ["-c", 'sandbox_mode="workspace-write"'] if session else
+                 ["-s", "read-only" if review else "workspace-write"])
         args += ["-c", 'approval_policy="never"', "--json", "-o", str(run_dir / "reply.txt")]
         if review:
             args += ["--skip-git-repo-check", "--output-schema", str(run_dir / "schema.json")]

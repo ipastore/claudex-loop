@@ -13,9 +13,11 @@ Leave marketplace auto-update off. Upstream changes are merged into this fork de
 
 ## The patches (all in `skills/claudex-loop/scripts/runner.py`)
 
-1. **Builds run unsandboxed.** `codex exec -s workspace-write` cannot reach
-   `/var/run/docker.sock`, so a build could never run `supabase db reset` or the SQL isolation
-   harness. Builds pass `--dangerously-bypass-approvals-and-sandbox`; **reviews stay `-s read-only`**.
+1. **Unsandboxed builds, opt-in per repo.** `codex exec -s workspace-write` cannot reach
+   `/var/run/docker.sock`, so a build could never run `supabase db reset` or a SQL harness. A repo
+   that needs it sets `CLAUDEX_UNSANDBOXED_BUILD=1` (in its `.claude/settings.json` `env`), and builds
+   then pass `--dangerously-bypass-approvals-and-sandbox`. Off by default: it gives the builder the
+   host's access, unattended. **Reviews stay `-s read-only` either way.**
 2. **Same-provider review when both models are named and differ.** Plan review and inspection used
    to require the opposite *provider*. They now also accept the same provider when `--model` and
    `--counterpart-model` are both given and differ, e.g. Opus builds and Fable inspects.
