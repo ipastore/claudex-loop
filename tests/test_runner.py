@@ -29,6 +29,10 @@ prompt = sys.stdin.read()
 case = os.environ.get('FAKE_CASE', 'ok')
 if case == 'timeout':
     time.sleep(30)
+if case == 'build_timeout':
+    pathlib.Path('built.py').write_text('half built\n')
+    print(json.dumps({'type':'thread.started', 'thread_id':'12345678-1234-4567-8123-123456789abc'}), flush=True)
+    time.sleep(30)
 if case == 'exit':
     print('Authentication failed', file=sys.stderr)
     sys.exit(7)
@@ -293,6 +297,35 @@ class RunnerTests(unittest.TestCase):
         code, _, _, error = self.invoke(mode="build", case="build", extra=extra+("--resume", str(path)))
         self.assertEqual(code, 1)
         self.assertIn("Checkout changed", error)
+
+    def test_timed_out_build_is_resumable_but_still_guards_the_checkout(self):
+        extra = ("--builder", "codex", "--unreviewed-spec", "--proof", "test", "--timeout", "3")
+        code, record, path, _ = self.invoke(mode="build", case="build_timeout", extra=extra)
+        self.assertEqual(code, 1)
+        self.assertEqual(record["status"], "interrupted")
+        self.assertEqual(record["session_id"], SESSION)
+        self.assertIn("built.py", {f["path"] for f in record["snapshot"]["files"]})
+        code, resumed, _, _ = self.invoke(mode="build", case="build", extra=extra+("--resume", str(path)))
+        self.assertEqual(code, 0, resumed)
+        self.assertEqual(resumed["base"], self.base)
+        self.assertEqual(resumed["session_id"], SESSION)
+        (self.repo / "built.py").write_text("a person edited this after the kill")
+        code, _, _, error = self.invoke(mode="build", case="build", extra=extra+("--resume", str(path)))
+        self.assertEqual(code, 1)
+        self.assertIn("Checkout changed", error)
+
+    def test_failed_build_and_timed_out_review_are_not_resumable(self):
+        extra = ("--builder", "codex", "--unreviewed-spec", "--proof", "test")
+        code, record, path, _ = self.invoke(mode="build", case="exit", extra=extra)
+        self.assertEqual(record["status"], "failed")
+        code, _, _, error = self.invoke(mode="build", case="build", extra=extra+("--resume", str(path)))
+        self.assertEqual(code, 1)
+        self.assertIn("Resume status", error)
+        code, record, path, _ = self.invoke(case="timeout", extra=("--timeout", "2"))
+        self.assertEqual(record["status"], "failed")
+        code, _, _, error = self.invoke(extra=("--resume", str(path)))
+        self.assertEqual(code, 1)
+        self.assertIn("Resume", error)
 
     def test_artifacts_cannot_contaminate_target_checkout(self):
         code, _, _, error = self.invoke(extra=("--artifacts", str(self.repo / "runs")))

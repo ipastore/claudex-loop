@@ -39,6 +39,10 @@ class RunError(Exception):
     pass
 
 
+class Interrupted(RunError):
+    """The CLI was killed on timeout or interruption; a build may still be resumed from it."""
+
+
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -204,8 +208,25 @@ def execute(argv: list[str], prompt: str, repo: Path, run_dir: Path, timeout: in
                 else:
                     os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
-                raise RunError("Run timed out or was interrupted; no approval recorded.") from exc
+                raise Interrupted("Run timed out or was interrupted; no approval recorded.") from exc
             return proc.returncode
+
+
+def started_session(provider: str, run_dir: Path):
+    """The session a killed Codex run announced before it was killed, or None."""
+    if provider != "codex":
+        return None
+    for line in (run_dir / "stdout.txt").read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "thread.started":
+            try:
+                return str(uuid.UUID(event.get("thread_id", "")))
+            except (ValueError, TypeError, AttributeError):
+                return None
+    return None
 
 
 def parse_result(provider: str, mode: str, run_dir: Path, expected_session=None) -> dict:
@@ -270,9 +291,16 @@ def previous_record(path: Path, repo: Path, plan: Path, provider: str, mode: str
     record = json.loads(path.read_text(encoding="utf-8"))
     for key, expected in {"repo": str(repo), "plan": str(plan), "provider": provider,
                           "mode": mode, "requested_model": model,
-                          "requested_effort": effort, "status": "completed"}.items():
+                          "requested_effort": effort}.items():
         if record.get(key) != expected:
             raise RunError(f"Resume {key} does not match this run. Start fresh instead.")
+    # A build killed on timeout still left its work and its session behind; resuming it is
+    # allowed when the record captured both. The checkout guard in run() still refuses any
+    # edit made after the kill.
+    resumable = record.get("status") == "completed" or (
+        mode == "build" and record.get("status") == "interrupted" and record.get("snapshot"))
+    if not resumable:
+        raise RunError("Resume status does not match this run. Start fresh instead.")
     try:
         uuid.UUID(record["session_id"])
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
@@ -419,6 +447,13 @@ def run(args) -> int:
                 raise RunError("Builder changed HEAD despite the no-commit contract. Inspect before proceeding.")
             record["snapshot"] = snapshot(repo, args.base)
         record["status"] = "completed"
+    except Interrupted as exc:
+        record.update(status="failed", error=str(exc))
+        if args.mode == "build":
+            session = previous["session_id"] if previous else started_session(provider, run_dir)
+            if session and git(repo, "rev-parse", "HEAD").decode().strip() == args.base:
+                record.update(status="interrupted", session_id=session,
+                              snapshot=snapshot(repo, args.base))
     except (RunError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         record.update(status="failed", error=str(exc))
     record["elapsed_seconds"] = round(time.time() - record["started_at"], 2)
